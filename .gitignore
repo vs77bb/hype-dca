@@ -1,0 +1,8 @@
+.claude/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+bridge_state.json
