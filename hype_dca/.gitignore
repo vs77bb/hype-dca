@@ -1,5 +1,9 @@
 .env
 bridge_state.json
+trade_state.json
+bot.log
+launchd.out.log
+launchd.err.log
 __pycache__/
 *.pyc
 *.pyo

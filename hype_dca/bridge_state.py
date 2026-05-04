@@ -17,6 +17,7 @@ class BridgeState(TypedDict):
     phase: str          # "awaiting_attestation"
     message_hash: str   # 0x-prefixed hex keccak256 of the raw CCTP message
     message_hex: str    # 0x-prefixed hex of the raw CCTP message bytes
+    tx_hash: str        # 0x-prefixed Arbitrum depositForBurn transaction hash
     amount_usdc: float
     initiated_at: str   # ISO-8601 UTC
 
@@ -38,11 +39,17 @@ def clear_state() -> None:
         os.remove(STATE_FILE)
 
 
-def new_state(message_hash: str, message_hex: str, amount_usdc: float) -> BridgeState:
+def new_state(
+    message_hash: str,
+    message_hex: str,
+    tx_hash: str,
+    amount_usdc: float,
+) -> BridgeState:
     return BridgeState(
         phase="awaiting_attestation",
         message_hash=message_hash,
         message_hex=message_hex,
+        tx_hash=tx_hash,
         amount_usdc=amount_usdc,
         initiated_at=datetime.now(timezone.utc).isoformat(),
     )

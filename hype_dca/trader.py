@@ -29,13 +29,13 @@ def resolve_hype_spot_market(info: Info) -> tuple[str, int]:
 
     if hype_index is None:
         raise RuntimeError("HYPE token not found in spot metadata")
+    sz_decimals: int = tokens[hype_index].get("szDecimals", 2)
 
     # Find the market that contains HYPE as one of its tokens
     # Each universe entry has a "tokens" list [baseIndex, quoteIndex]
     for market in universe:
         market_tokens = market.get("tokens", [])
         if hype_index in market_tokens:
-            sz_decimals: int = market.get("szDecimals", 4)
             market_name: str = market.get("name", "")
             log.info(f"Resolved HYPE spot market: {market_name!r} szDecimals={sz_decimals}")
             return market_name, sz_decimals
@@ -62,12 +62,17 @@ def buy_hype_spot(
 
     Uses IOC market order (market_open internally converts to a limit with slippage).
     """
-    size = round(config.DAILY_BUY_USDC / current_price, sz_decimals)
+    order_usdc = max(config.DAILY_BUY_USDC, config.MIN_SPOT_ORDER_USDC)
+    size = round(order_usdc / current_price, sz_decimals)
     log.info(
         f"Placing spot buy: {size} HYPE @ ~{current_price:.4f} "
-        f"(~${config.DAILY_BUY_USDC:.2f} USDC) on {market}"
+        f"(~${order_usdc:.2f} USDC) on {market}"
     )
     result = exchange.market_open(market, is_buy=True, sz=size, slippage=0.01)
+    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    errors = [status["error"] for status in statuses if "error" in status]
+    if errors:
+        raise RuntimeError(f"Spot buy rejected: {'; '.join(errors)}")
     return result
 
 

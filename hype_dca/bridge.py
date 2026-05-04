@@ -44,7 +44,8 @@ ERC20_ABI = [
      ]},
 ]
 
-# CCTP V2 TokenMessenger — depositForBurn includes a messageBody parameter (not present in V1)
+# CCTP V2 TokenMessenger
+# depositForBurn(uint256,uint32,bytes32,address,bytes32,uint256,uint32)
 TOKEN_MESSENGER_ABI = [
     {"name": "depositForBurn", "type": "function", "stateMutability": "nonpayable",
      "inputs": [
@@ -52,9 +53,11 @@ TOKEN_MESSENGER_ABI = [
          {"name": "destinationDomain", "type": "uint32"},
          {"name": "mintRecipient", "type": "bytes32"},
          {"name": "burnToken", "type": "address"},
-         {"name": "messageBody", "type": "bytes"},
+         {"name": "destinationCaller", "type": "bytes32"},
+         {"name": "maxFee", "type": "uint256"},
+         {"name": "minFinalityThreshold", "type": "uint32"},
      ],
-     "outputs": [{"name": "nonce", "type": "uint64"}]},
+     "outputs": []},
 ]
 
 # MessageTransmitter emits MessageSent(bytes) — same event in V1 and V2
@@ -71,12 +74,16 @@ MSG_TRANSMITTER_ABI = [
 
 DEPOSIT_WALLET_ABI = [
     {"name": "deposit", "type": "function", "stateMutability": "nonpayable",
-     "inputs": [{"name": "amount", "type": "uint256"}],
+     "inputs": [
+         {"name": "amount", "type": "uint256"},
+         {"name": "destinationDex", "type": "uint32"},
+     ],
      "outputs": []},
 ]
 
 # ERC20 Transfer topic: keccak256("Transfer(address,address,uint256)")
 ERC20_TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+HYPERCORE_SPOT_DEX = 2**32 - 1
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -88,12 +95,25 @@ def _to_bytes32(address: str) -> bytes:
 
 def _build_and_send(w3: Web3, fn, from_address: str, private_key: str) -> object:
     """Build, sign, send a contract call and wait for receipt. Returns receipt."""
+    gas_limit = fn.estimate_gas({"from": from_address})
+    max_priority = w3.eth.max_priority_fee
+    base_fee = w3.eth.get_block("latest")["baseFeePerGas"]
+    max_fee = max_priority + (2 * base_fee)
+    min_required_balance = gas_limit * max_fee
+    native_balance = w3.eth.get_balance(from_address)
+    if native_balance < min_required_balance:
+        have = float(w3.from_wei(native_balance, "ether"))
+        need = float(w3.from_wei(min_required_balance, "ether"))
+        raise RuntimeError(
+            f"Insufficient native gas balance for transaction. "
+            f"Have {have:.8f}, need at least {need:.8f}."
+        )
     tx = fn.build_transaction({
         "from": from_address,
         "nonce": w3.eth.get_transaction_count(from_address),
-        "gas": fn.estimate_gas({"from": from_address}),
-        "maxFeePerGas": w3.eth.max_priority_fee + (2 * w3.eth.get_block("latest")["baseFeePerGas"]),
-        "maxPriorityFeePerGas": w3.eth.max_priority_fee,
+        "gas": gas_limit,
+        "maxFeePerGas": max_fee,
+        "maxPriorityFeePerGas": max_priority,
     })
     signed = w3.eth.account.sign_transaction(tx, private_key)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -157,7 +177,9 @@ def initiate_bridge(amount_usdc: float) -> None:
         config.HYPER_EVM_CCTP_DOMAIN,
         _to_bytes32(config.WALLET_ADDRESS),
         usdc_addr,
-        b"",
+        b"\x00" * 32,  # destinationCaller = anyone can call receiveMessage on destination
+        0,             # maxFee = 0 for standard transfer
+        2000,          # minFinalityThreshold = finalized transfer
     ).build_transaction({
         "from": wallet,
         "nonce": w3.eth.get_transaction_count(wallet),
@@ -186,9 +208,10 @@ def initiate_bridge(amount_usdc: float) -> None:
 
     message_hash = "0x" + Web3.keccak(message_bytes).hex()
     message_hex = "0x" + message_bytes.hex()
-    state = new_state(message_hash, message_hex, amount_usdc)
+    tx_hash_hex = "0x" + tx_hash.hex()
+    state = new_state(message_hash, message_hex, tx_hash_hex, amount_usdc)
     save_state(state)
-    log.info(f"Bridge initiated. tx={tx_hash.hex()} message_hash={message_hash}")
+    log.info(f"Bridge initiated. tx={tx_hash_hex} message_hash={message_hash}")
 
 
 # ── Phase 2: Receive attestation on HyperEVM + deposit to HyperCore ──────────
@@ -198,8 +221,16 @@ def try_complete_bridge(state: BridgeState) -> bool:
 
     Returns True when USDC is fully deposited to HyperCore, False if still pending.
     """
+    tx_hash = state.get("tx_hash")
+    if not tx_hash:
+        raise RuntimeError(
+            "Bridge state is missing tx_hash. Add the Arbitrum depositForBurn "
+            "transaction hash to bridge_state.json, then rerun."
+        )
+
     resp = requests.get(
-        f"{config.CIRCLE_ATTESTATION_URL}/{state['message_hash']}",
+        f"{config.CIRCLE_ATTESTATION_URL}/{config.ARBITRUM_CCTP_DOMAIN}",
+        params={"transactionHash": tx_hash},
         timeout=15,
     )
     if resp.status_code == 404:
@@ -215,46 +246,56 @@ def try_complete_bridge(state: BridgeState) -> bool:
 
     attestation_hex: str = messages[0]["attestation"]
     attestation_bytes = bytes.fromhex(attestation_hex.removeprefix("0x"))
-    message_bytes = bytes.fromhex(state["message_hex"].removeprefix("0x"))
+    message_hex = messages[0].get("message") or state["message_hex"]
+    message_bytes = bytes.fromhex(message_hex.removeprefix("0x"))
     amount_raw = int(state["amount_usdc"] * 1e6)
 
     w3 = Web3(Web3.HTTPProvider(config.HYPER_EVM_RPC))
     wallet = Web3.to_checksum_address(config.WALLET_ADDRESS)
+    native_usdc_addr = Web3.to_checksum_address(config.HYPER_EVM_NATIVE_USDC)
+    native_usdc = w3.eth.contract(address=native_usdc_addr, abi=ERC20_ABI)
+    native_usdc_balance = native_usdc.functions.balanceOf(wallet).call()
 
-    # Submit attestation → mints native USDC to our wallet on HyperEVM
-    log.info("Submitting CCTP attestation to HyperEVM MessageTransmitter")
-    transmitter = w3.eth.contract(
-        address=Web3.to_checksum_address(config.CCTP_MSG_TRANSMITTER),
-        abi=MSG_TRANSMITTER_ABI,
-    )
-    mint_receipt = _build_and_send(
-        w3,
-        transmitter.functions.receiveMessage(message_bytes, attestation_bytes),
-        wallet,
-        config.PRIVATE_KEY,
-    )
-
-    # Identify the native USDC ERC20 address from the mint receipt:
-    # CCTP mints by emitting Transfer(from=address(0), to=wallet, value=amount).
-    # The log's address field is the USDC ERC20 contract on HyperEVM.
-    usdc_erc20_addr: str | None = None
-    wallet_lower = wallet.lower()
-    for log_entry in mint_receipt["logs"]:
-        topics = log_entry["topics"]
-        if (
-            len(topics) >= 3
-            and topics[0].hex() == ERC20_TRANSFER_TOPIC
-            and topics[1].hex()[-40:] == "00" * 20  # from = address(0)
-            and topics[2].hex()[-40:].lower() == wallet_lower.removeprefix("0x")
-        ):
-            usdc_erc20_addr = Web3.to_checksum_address(log_entry["address"])
-            break
-
-    if usdc_erc20_addr is None:
-        raise RuntimeError(
-            "Could not identify minted USDC ERC20 address from receiveMessage receipt"
+    if native_usdc_balance >= amount_raw:
+        usdc_erc20_addr = native_usdc_addr
+        log.info(
+            f"Native USDC already present on HyperEVM: {native_usdc_balance / 1e6:.2f}"
         )
-    log.info(f"Native USDC on HyperEVM: {usdc_erc20_addr}")
+    else:
+        # Submit attestation → mints native USDC to our wallet on HyperEVM
+        log.info("Submitting CCTP attestation to HyperEVM MessageTransmitter")
+        transmitter = w3.eth.contract(
+            address=Web3.to_checksum_address(config.CCTP_MSG_TRANSMITTER),
+            abi=MSG_TRANSMITTER_ABI,
+        )
+        mint_receipt = _build_and_send(
+            w3,
+            transmitter.functions.receiveMessage(message_bytes, attestation_bytes),
+            wallet,
+            config.PRIVATE_KEY,
+        )
+
+        # Identify the native USDC ERC20 address from the mint receipt:
+        # CCTP mints by emitting Transfer(from=address(0), to=wallet, value=amount).
+        # The log's address field is the USDC ERC20 contract on HyperEVM.
+        usdc_erc20_addr = None
+        wallet_lower = wallet.lower()
+        for log_entry in mint_receipt["logs"]:
+            topics = log_entry["topics"]
+            if (
+                len(topics) >= 3
+                and topics[0].hex() == ERC20_TRANSFER_TOPIC
+                and topics[1].hex()[-40:] == "00" * 20  # from = address(0)
+                and topics[2].hex()[-40:].lower() == wallet_lower.removeprefix("0x")
+            ):
+                usdc_erc20_addr = Web3.to_checksum_address(log_entry["address"])
+                break
+
+        if usdc_erc20_addr is None:
+            raise RuntimeError(
+                "Could not identify minted USDC ERC20 address from receiveMessage receipt"
+            )
+        log.info(f"Native USDC on HyperEVM: {usdc_erc20_addr}")
 
     # Fetch CoreDepositWallet (bridge contract: moves ERC20 USDC → HyperCore)
     core_deposit_wallet = _fetch_core_deposit_wallet()
@@ -272,10 +313,10 @@ def try_complete_bridge(state: BridgeState) -> bool:
 
     # Deposit to HyperCore
     deposit_wallet = w3.eth.contract(address=core_deposit_wallet, abi=DEPOSIT_WALLET_ABI)
-    log.info(f"Depositing {state['amount_usdc']} USDC to HyperCore")
+    log.info(f"Depositing {state['amount_usdc']} USDC to HyperCore spot")
     _build_and_send(
         w3,
-        deposit_wallet.functions.deposit(amount_raw),
+        deposit_wallet.functions.deposit(amount_raw, HYPERCORE_SPOT_DEX),
         wallet,
         config.PRIVATE_KEY,
     )
